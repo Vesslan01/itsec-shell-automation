@@ -1,0 +1,4 @@
+ssh
+cron
+apache2
+mysqld
