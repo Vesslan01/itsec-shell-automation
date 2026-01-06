@@ -41,3 +41,13 @@ Båda säkerhetsskripten kan:
 ### Bash
 ```bash
 bash basic-security-check.sh
+## Hot Detection Engine (Python)
+
+### Input
+- `users.csv` (username,status)
+- `events.json` (events list with user + event)
+- `auth.log` (text log lines containing "failed" and IP addresses)
+
+### Run
+```bash
+python hot_detection_engine.py
