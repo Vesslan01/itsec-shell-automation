@@ -1,0 +1,11 @@
+# Log files
+*.log
+*_report.log
+
+# Generated reports
+risk_report.txt
+
+# Analysis outputs
+analysis.log
+security_log.txt
+process_check.log
