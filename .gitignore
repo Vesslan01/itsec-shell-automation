@@ -13,3 +13,4 @@ process_check.log
 
 # OS / editor
 .DS_Store
+analysis_engine.py
