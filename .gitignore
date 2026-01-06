@@ -1,11 +1,15 @@
-# Log files
+# Loggar
 *.log
 *_report.log
 
-# Generated reports
+# Python-rapporter
 risk_report.txt
+final_report.txt
 
-# Analysis outputs
+# Analysoutput
 analysis.log
 security_log.txt
 process_check.log
+
+# OS / editor
+.DS_Store
