@@ -1,67 +1,129 @@
 import csv
 import json
 import re
-from collections import defaultdict
-
-USERS_CSV = "users.csv"
-EVENTS_JSON = "events.json"
-AUTH_LOG = "auth.log"
-REPORT_FILE = "final_report.txt"
-
-IP_REGEX = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})")
-FAILED_REGEX = re.compile(r"failed", re.IGNORECASE)
+from pathlib import Path
+from datetime import datetime
+from collections import Counter
 
 
-def load_users(path: str) -> dict:
+# ----------------------------
+# Config
+# ----------------------------
+USERS_CSV = Path("users.csv")
+EVENTS_JSON = Path("events.json")
+AUTH_LOG = Path("auth.log")
+REPORT_FILE = Path("final_report.txt")
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def now_ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def require_file(path: Path) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing required file: {path}")
+
+
+def load_users(csv_path: Path) -> dict:
+    """
+    Returns dict:
+      users[username] = {"status": "active/disabled", "fails": 0}
+    """
+    require_file(csv_path)
     users = {}
-    with open(path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        required_cols = {"username", "status"}
+        if not reader.fieldnames or not required_cols.issubset(set(reader.fieldnames)):
+            raise ValueError(f"{csv_path} must contain columns: username,status")
+
+        for row in reader:
             username = (row.get("username") or "").strip()
             status = (row.get("status") or "").strip().lower()
-
             if not username:
                 continue
             if status not in {"active", "disabled"}:
-                # Default: om datan är kass, behandla som active (men man kan lika gärna flagga)
-                status = "active"
-
+                status = "active"  # default safe fallback
             users[username] = {"status": status, "fails": 0}
+
     return users
 
 
-def apply_event_fails(users: dict, path: str) -> None:
-    with open(path, encoding="utf-8") as f:
+def load_events(json_path: Path) -> list[dict]:
+    require_file(json_path)
+    with json_path.open(encoding="utf-8") as f:
         data = json.load(f)
 
-    events = data.get("events", [])
+    events = data.get("events")
+    if not isinstance(events, list):
+        raise ValueError(f"{json_path} must contain a top-level 'events' list")
+    return events
+
+
+def apply_event_fails(users: dict, events: list[dict]) -> dict:
+    """
+    Count failed_login events per user.
+    If user not in CSV -> track under 'unknown_users' bucket.
+    """
+    unknown_users = Counter()
+
     for e in events:
-        if e.get("event") == "failed_login":
-            user = e.get("user")
-            if user in users:
-                users[user]["fails"] += 1
+        user = (e.get("user") or "").strip()
+        ev = (e.get("event") or "").strip().lower()
+
+        if ev != "failed_login":
+            continue
+        if not user:
+            continue
+
+        if user in users:
+            users[user]["fails"] += 1
+        else:
+            unknown_users[user] += 1
+
+    return {"unknown_users": unknown_users}
 
 
-def parse_auth_log_for_ip_fails(path: str) -> dict:
-    ip_fail_count = defaultdict(int)
+def parse_auth_log_ips(log_path: Path) -> Counter:
+    """
+    Count failed lines per IP address in auth.log.
+    Looks for 'failed' case-insensitively + first IPv4 in line.
+    """
+    require_file(log_path)
+    ip_counts = Counter()
 
-    with open(path, encoding="utf-8") as f:
+    ip_regex = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+    failed_regex = re.compile(r"failed", re.IGNORECASE)
+
+    with log_path.open(encoding="utf-8", errors="replace") as f:
         for line in f:
-            if FAILED_REGEX.search(line):
-                m = IP_REGEX.search(line)
-                if m:
-                    ip_fail_count[m.group(1)] += 1
+            if not failed_regex.search(line):
+                continue
+            m = ip_regex.search(line)
+            if not m:
+                continue
+            ip = m.group(1)
+            ip_counts[ip] += 1
 
-    return dict(ip_fail_count)
+    return ip_counts
 
 
-def classify_user(userinfo: dict) -> str:
-    fails = userinfo["fails"]
-    status = userinfo["status"]
-
-    # Regeln “disabled + fails” trumfar allt
+# ----------------------------
+# Risk logic
+# ----------------------------
+def classify_user(status: str, fails: int) -> str:
+    """
+    Rules (from lesson):
+      disabled + fails >= 1 -> CRITICAL
+      fails >= 3 -> HIGH RISK
+      fails >= 1 -> MEDIUM RISK
+      else -> LOW RISK
+    """
     if status == "disabled" and fails >= 1:
         return "CRITICAL"
-
     if fails >= 3:
         return "HIGH RISK"
     if fails >= 1:
@@ -70,6 +132,12 @@ def classify_user(userinfo: dict) -> str:
 
 
 def classify_ip(fails: int) -> str:
+    """
+    Rules (from lesson):
+      fails >= 5 -> BRUTE FORCE SUSPECT
+      fails >= 1 -> SUSPICIOUS
+      else -> LOW
+    """
     if fails >= 5:
         return "BRUTE FORCE SUSPECT"
     if fails >= 1:
@@ -77,29 +145,62 @@ def classify_ip(fails: int) -> str:
     return "LOW"
 
 
-def write_report(users: dict, ip_fails: dict, path: str) -> None:
-    with open(path, "w", encoding="utf-8") as r:
+# ----------------------------
+# Reporting
+# ----------------------------
+def write_report(report_path: Path, users: dict, ip_counts: Counter, unknown_users: Counter) -> None:
+    # Summary stats
+    user_risks = Counter()
+    for u, info in users.items():
+        user_risks[classify_user(info["status"], info["fails"])] += 1
+
+    with report_path.open("w", encoding="utf-8") as r:
+        r.write(f"Report generated: {now_ts()}\n")
         r.write("=== USER RISK REPORT ===\n")
         for username in sorted(users.keys()):
             info = users[username]
-            r.write(
-                f"{username}: {classify_user(info)} "
-                f"(fails={info['fails']}, status={info['status']})\n"
-            )
+            risk = classify_user(info["status"], info["fails"])
+            r.write(f"{username}: {risk} (fails={info['fails']}, status={info['status']})\n")
 
         r.write("\n=== IP RISK REPORT ===\n")
-        for ip in sorted(ip_fails.keys()):
-            count = ip_fails[ip]
-            r.write(f"{ip}: {classify_ip(count)} (fails={count})\n")
+        if ip_counts:
+            for ip, count in ip_counts.most_common():
+                r.write(f"{ip}: {classify_ip(count)} (fails={count})\n")
+        else:
+            r.write("No failed-login IPs found in auth.log\n")
+
+        if unknown_users:
+            r.write("\n=== UNKNOWN USERS (in events.json but not in users.csv) ===\n")
+            for user, count in unknown_users.most_common():
+                r.write(f"{user}: failed_login={count}\n")
+
+        r.write("\n=== SUMMARY ===\n")
+        r.write(f"Total users in CSV: {len(users)}\n")
+        r.write(f"Total IPs with failed attempts: {len(ip_counts)}\n")
+        r.write("User risk counts:\n")
+        for k in ["CRITICAL", "HIGH RISK", "MEDIUM RISK", "LOW RISK"]:
+            r.write(f"  {k}: {user_risks.get(k, 0)}\n")
 
 
-def main() -> None:
-    users = load_users(USERS_CSV)
-    apply_event_fails(users, EVENTS_JSON)
-    ip_fails = parse_auth_log_for_ip_fails(AUTH_LOG)
-    write_report(users, ip_fails, REPORT_FILE)
-    print(f"Analys klar. Se {REPORT_FILE}.")
+def main() -> int:
+    try:
+        users = load_users(USERS_CSV)
+        events = load_events(EVENTS_JSON)
+
+        meta = apply_event_fails(users, events)
+        unknown_users = meta["unknown_users"]
+
+        ip_counts = parse_auth_log_ips(AUTH_LOG)
+
+        write_report(REPORT_FILE, users, ip_counts, unknown_users)
+
+        print(f"OK: Analysis complete. See {REPORT_FILE}")
+        return 0
+
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
